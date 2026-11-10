@@ -1,0 +1,17 @@
+# Compatibility environment for the existing Python 3.8/Foxy container.
+# This differs from upstream Jazzy (especially MuJoCo >=3.3.6).
+numpy==1.24.4
+onnxruntime==1.17.3
+mujoco==3.2.3
+pin==2.7.0
+hpp-fcl==2.4.4
+cmeel-octomap==1.10.0
+typeguard==2.13.3
+jinja2
+PyYAML
+tqdm
+readchar
+loop-rate-limiters
+
+# Shared arm transport dependency; SDK 0.6.2 is vendored in third_party.
+python-can==4.5.0

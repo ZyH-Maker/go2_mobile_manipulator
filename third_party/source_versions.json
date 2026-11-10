@@ -1,0 +1,20 @@
+{
+  "acquisition": "GitHub codeload source archives; git clone failed due to network timeout; no Git history or initialized nested submodules",
+  "root": {
+    "repository": "iit-DLSLab/LocoPilot",
+    "commit": "93c48fc3ff12de4ee5b96b7d64644454ea7b0d48"
+  },
+  "submodules": {
+    "locomanipulation-teleop-isaaclab": "4f735d06848d3230055832f260d73e9f90133186",
+    "muse": "85d9c297bf7984a484bb1ec4bcbb768fe63fb089",
+    "piper-ros2-dls": "ca007295231c2b911bb1b959e02bab34d0348d0c",
+    "unitree-ros2-dls": "29dbb133f02124430677741fc8f9cb682169f3e9"
+  },
+  "layout": {
+    "locomotion_policy": "third_party/locomotion_policy",
+    "unitree-ros2-dls": "third_party/go2_driver",
+    "muse": "third_party/state_estimator",
+    "Gamepad_PiPER": "arm (locally adapted; no original Git history retained)",
+    "piper-ros2-dls": "only referenced standard URDF retained in models/piper_limits.urdf"
+  }
+}

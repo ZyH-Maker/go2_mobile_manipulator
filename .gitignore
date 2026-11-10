@@ -1,0 +1,33 @@
+# Machine-local environments and ROS build output
+/runtime/
+/build/
+/install/
+/log/
+.venv/
+venv/
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local credentials; keep example environment files versioned
+.env
+.env.*
+!.env.example
+!.env.sample
+.ssh/
+.codex/
+.git-credentials
+.netrc
+auth.json

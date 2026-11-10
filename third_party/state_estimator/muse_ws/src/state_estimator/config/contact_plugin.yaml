@@ -1,0 +1,10 @@
+contact_detection_plugin:
+  plugin: "ContactDetectionPlugin"
+  # LowState topic from the Unitree SDK
+  low_state_topic: "/lowstate"
+
+  pub_topic: "muse/contact_detection"
+
+  # Threshold on foot_force scalar (int16) from LowState
+  # LF=foot_force[0], RF=foot_force[1], RL=foot_force[2], RR=foot_force[3]
+  contact_force_threshold: 10.0
