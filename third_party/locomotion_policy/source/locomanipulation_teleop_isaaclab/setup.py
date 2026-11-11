@@ -27,13 +27,12 @@ setup(
     description=EXTENSION_TOML_DATA["package"]["description"],
     keywords=EXTENSION_TOML_DATA["package"]["keywords"],
     install_requires=INSTALL_REQUIRES,
-    license="Apache 2.0",
+    license="BSD-3-Clause",
     include_package_data=True,
     python_requires=">=3.10",
     classifiers=[
         "Natural Language :: English",
         "Programming Language :: Python :: 3.10",
-        "Isaac Sim :: 4.5.0",
     ],
     zip_safe=False,
 )

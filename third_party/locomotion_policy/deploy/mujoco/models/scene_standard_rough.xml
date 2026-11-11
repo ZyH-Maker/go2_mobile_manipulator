@@ -1,0 +1,12 @@
+<mujoco model="standard_piper_rough">
+  <include file="go2_piper_standard.xml" />
+  <worldbody>
+    <light pos="0 0 5" dir="0 0 -1" directional="true" />
+    <geom name="floor" type="plane" size="30 30 0.1" rgba="0.4 0.45 0.4 1" friction="0.8 0.005 0.0001" />
+    <geom name="step_0" type="box" size="0.18 1 0.025" pos="1.5 0 0.025" rgba="0.5 0.5 0.5 1" />
+    <geom name="step_1" type="box" size="0.18 1 0.06" pos="1.8599999999999999 0 0.06" rgba="0.5 0.5 0.5 1" />
+    <geom name="step_2" type="box" size="0.18 1 0.105" pos="2.2199999999999998 0 0.105" rgba="0.5 0.5 0.5 1" />
+    <geom name="step_3" type="box" size="0.18 1 0.06" pos="2.58 0 0.06" rgba="0.5 0.5 0.5 1" />
+    <geom name="step_4" type="box" size="0.18 1 0.025" pos="2.94 0 0.025" rgba="0.5 0.5 0.5 1" />
+  </worldbody>
+</mujoco>

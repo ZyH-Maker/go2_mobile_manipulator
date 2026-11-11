@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+logs/
+reports/
+videos/
+source/locomanipulation_teleop_isaaclab/locomanipulation_teleop_isaaclab/assets/generated/
+*.egg-info/

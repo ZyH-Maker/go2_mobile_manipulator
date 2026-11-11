@@ -81,6 +81,8 @@ python /workspace/go2_mobile_manipulator/locomotion/run_base.py --interface eth1
 
 底盘策略的上游关系、论文来源、重新训练、台阶训练、更换机器人模型和部署适配，见 [底盘策略训练与部署说明](docs/policy_training.md)。
 
+训练子项目现已改为标准 PiPER 的 Flat/Rough 两个任务，支持机械臂连续平滑运动和 `vx、vy、wz、pitch、高度偏移` 五维指令。资产生成、训练、验证、导出和 MuJoCo sim2sim 步骤见 [新训练 README](third_party/locomotion_policy/README.md)。当前真机入口仍使用原 Piper L 权重；新训练代码尚需 Isaac Lab 环境验收，不会自动替换真机策略。
+
 机械臂目标输入为 `/follower/arm_controller/joint_trajectory`，类型 `trajectory_msgs/msg/JointTrajectory`。反馈为 `/follower/feedback/joint_states`。只运行一个目标发布者，未来模型控制器替换键盘即可；详见 [机械臂接口](docs/arm_interface.md)。
 
 `camera/reference/` 保留双 RealSense 相机与机械臂轨迹控制器的参考 launch。它们来自 Jazzy 方案，当前作为参考，不是 Foxy 下已验证的相机入口。后续相机节点可与现有机械臂执行节点并行，给模型控制器提供图像。

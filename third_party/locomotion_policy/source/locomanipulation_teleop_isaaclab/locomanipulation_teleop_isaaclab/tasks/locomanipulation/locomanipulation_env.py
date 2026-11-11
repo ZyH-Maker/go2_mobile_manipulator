@@ -1,523 +1,208 @@
-# Copyright (c) 2022-2024, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
-from __future__ import annotations
-
-import gymnasium as gym
+# Derived from the upstream BSD-3-Clause DirectRLEnv; see ../../../../../LICENSE.
+"""Leg-only PPO with moving standard PiPER and commanded speed/pitch/height."""
+import hashlib
 import torch
-from pxr import Sdf, UsdPhysics
-
-import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
-import isaaclab.utils.math as math_utils
-from isaaclab.assets import Articulation, ArticulationCfg
-from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensor, ContactSensorCfg, RayCaster, RayCasterCfg, patterns, Imu
-from isaaclab.sim import SimulationCfg
-from isaaclab.terrains import TerrainImporterCfg
-from isaaclab.utils import configclass
+from isaaclab.assets import Articulation
+from isaaclab.envs import DirectRLEnv
+from isaaclab.sensors import ContactSensor, RayCaster
+from isaaclab.utils import math as math_utils
+import policy_contract as spec
+from motion import Motion
+from .locomanipulation_env_cfg import Go2FlatEnvCfg, Go2RoughEnvCfg
+from ...assets.go2_piper_standard_asset import USD
 
-from locomanipulation_teleop_isaaclab.tasks import custom_observations, custom_rewards, custom_events
-from locomanipulation_teleop_isaaclab.tasks.supervised_learning_networks import FrozenRandomMlpEncoder, create_supervised_network
-from .locomanipulation_env_cfg import Go2FlatEnvCfg, Go2RoughVisionEnvCfg, Go2RoughBlindEnvCfg
 
 class LocomotionManipulationEnv(DirectRLEnv):
-
-    _ARM_BODY_NAMES = tuple(f"link{i}" for i in range(1, 9))
-
-    def __init__(self, cfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg, render_mode=None, **kwargs):
+        if abs(cfg.sim.dt-spec.DT)>1.e-10 or cfg.decimation!=spec.DECIMATION:
+            raise ValueError('Control timing must match policy_contract.py; update the shared contract before changing it')
+        fingerprint = USD.parent/'model.sha256'
+        if not USD.exists() or not fingerprint.exists() or fingerprint.read_text().strip() != hashlib.sha256(spec.MODEL.read_bytes()).hexdigest():
+            raise RuntimeError('Missing/stale USD. Run scripts/assets/convert_usd.py --headless first.')
         super().__init__(cfg, render_mode, **kwargs)
-
-        # Joint position command (deviation from default joint positions)
-        self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
-        self._previous_actions = torch.zeros(
-            self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device
-        )
-        self._previous_previous_actions = torch.zeros(
-            self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device
-        )
-
-        # X/Y linear velocity, yaw angular velocity, pitch and height commands
-        self._velocity_commands = torch.zeros(self.num_envs, 3, device=self.device)
-        self._pose_commands = torch.zeros(self.num_envs, 2, device=self.device) # pitch height
-
-        # Arm joint-space trajectories (one target and timer per environment)
-        self._joints_arm_command_pos = torch.zeros(self.num_envs, 6, device=self.device)
-        self._arm_trajectory_start_pos = torch.zeros_like(self._joints_arm_command_pos)
-        self._arm_trajectory_target_pos = torch.zeros_like(self._joints_arm_command_pos)
-        self._arm_trajectory_elapsed_s = torch.zeros(self.num_envs, device=self.device)
-        self._arm_trajectory_duration_s = torch.zeros(self.num_envs, device=self.device)
-        self._arm_target_elapsed_s = torch.zeros(self.num_envs, device=self.device)
-        self._arm_target_update_interval_s = torch.zeros(self.num_envs, device=self.device)
-
-
-        # Swing peak
-        self._swing_peak = torch.tensor([0.0, 0.0, 0.0, 0.0], device=self.device).repeat(self.num_envs,1)
-        self._swing_peak_periodic = torch.tensor([0.0, 0.0, 0.0, 0.0], device=self.device).repeat(self.num_envs,1)
-        
-        # Desired Hip Offset
-        self._desired_hip_offset = torch.tensor([-self.cfg.desired_hip_offset, self.cfg.desired_hip_offset, -self.cfg.desired_hip_offset, self.cfg.desired_hip_offset], device=self.device)
-        
-        # Periodic gait
-        self._step_freq = torch.tensor(self.cfg.desired_step_freq, device=self.device)
-        self._duty_factor = torch.tensor(self.cfg.desired_duty_factor, device=self.device)
-        self._phase_offset = torch.tensor(self.cfg.desired_phase_offset, device=self.device).repeat(self.num_envs,1)
-        self._phase_signal = self._phase_offset.clone()# + self.step_dt * self._step_freq * torch.rand(self.num_envs, 1, device=self.device)*10.
-        self._phase_signal = self._phase_signal % 1.0
-
-
-        # Observation history
-        self._observation_history = torch.zeros(self.num_envs, cfg.history_length, cfg.single_observation_space, device=self.device)
-
-        # RMA
-        if(cfg.use_rma == True):
-            self._rma_network = create_supervised_network(
-                cfg.rma_observation_space,
-                cfg.rma_output_space,
-                network_type=getattr(cfg, "rma_network_type", "mlp"),
-                sequence_length=cfg.rma_history_length,
-            )
-            self._rma_network.to(self.device)
-            
-            if self.cfg.rma_use_latent_space:
-                self._rma_latent_encoder = FrozenRandomMlpEncoder(
-                    cfg.rma_privileged_observation_space,
-                    cfg.rma_output_space,
-                    hidden_features=getattr(cfg, "rma_latent_encoder_hidden_features", 128),
-                    seed=getattr(cfg, "rma_latent_encoder_seed", 0),
-                )
-                self._rma_latent_encoder.to(self.device)
-            self._observation_history_rma = torch.zeros(self.num_envs, cfg.rma_history_length, cfg.single_rma_observation_space, device=self.device)
-            if self.cfg.observation_noise_model:
-                self._observation_noise_model_rma: NoiseModel = self.cfg.observation_noise_model.class_type(
-                    self.cfg.observation_noise_model, num_envs=self.num_envs, device=self.device
-                )
-
-        # Learned State Estimator
-        if(cfg.use_concurrent_state_est == True):
-            self._concurrent_state_est_network = create_supervised_network(
-                cfg.concurrent_state_est_observation_space,
-                cfg.concurrent_state_est_output_space,
-                network_type=getattr(cfg, "concurrent_state_est_network_type", "mlp"),
-                sequence_length=cfg.concurrent_state_est_history_length,
-            )
-            self._concurrent_state_est_network.to(self.device)
-            self._observation_history_concurrent_state_est = torch.zeros(self.num_envs, cfg.concurrent_state_est_history_length, cfg.single_concurrent_state_est_observation_space, device=self.device)
-            if self.cfg.observation_noise_model:
-                self._observation_noise_model_concurrent_state_est: NoiseModel = self.cfg.observation_noise_model.class_type(
-                    self.cfg.observation_noise_model, num_envs=self.num_envs, device=self.device
-                )
-
-
-        # Logging
-        self._episode_sums = {
-            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-            for key in [
-                 "track_height_exp",
-                "track_lin_vel_xy_exp",
-                "track_lin_vel_z_l2",
-                "track_orientation_l2",
-                "track_ang_vel_xy_l2",
-                "track_ang_vel_z_exp",
-
-                "undesired_contacts",
-                "action_rate_l2",
-                "action_smoothness_l2",
-                
-                "joints_hip_pos_l2",
-                "joints_thigh_pos_l2",
-                "joints_calf_pos_l2",
-                "joints_acc_l2",
-                "joints_torques_l2",
-                "joints_energy_l1",
-                
-                "feet_air_time",
-                "feet_air_time_variance",
-
-                "feet_height_clearance_periodic",
-                "feet_height_clearance_aperiodic",
-                "feet_height_clearance_mujoco_periodic",
-                "feet_height_clearance_mujoco_aperiodic",
-                "feet_slide",
-                "feet_to_hip_distance_l2",
-                "feet_edge",
-                "feet_vertical_surface_contacts",
-
-                "periodic_contact_suggestion",
-                "stance_contact_suggestion",
-            ]
-        }
-        # Get specific body indices
-        self._base_contact_sensor_id, _ = self._contact_sensor.find_bodies("base")
-        self._feet_contact_sensor_ids, _ = self._contact_sensor.find_bodies(["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True)
-        self._hip_contact_sensor_ids, _ = self._contact_sensor.find_bodies(["FL_hip", "FR_hip", "RL_hip", "RR_hip"], preserve_order=True)
-        self._thigh_contact_sensor_ids, _ = self._contact_sensor.find_bodies(["FL_thigh", "FR_thigh", "RL_thigh", "RR_thigh"], preserve_order=True)
-        self._undesired_contact_body_ids = self._base_contact_sensor_id + self._hip_contact_sensor_ids + self._thigh_contact_sensor_ids
-
-        
-        self._feet_ids_robot, _ = self._robot.find_bodies(["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True)
-        self._hip_ids_robot, _ = self._robot.find_bodies(["FL_hip", "FR_hip", "RL_hip", "RR_hip"], preserve_order=True)
-        self._ids_joints_order = self._robot.find_joints(name_keys=self.cfg.desired_joints_order, preserve_order=True)[0]
-        self._ids_only_legs_joints_order = self._robot.find_joints(name_keys=self.cfg.desired_joints_order[0:12], preserve_order=True)[0]
-        self._ids_only_arms_joints_order = self._robot.find_joints(name_keys=self.cfg.desired_joints_order[12:18], preserve_order=True)[0]
-
-        if getattr(self.cfg, "visualize_edge_map", False):
-            self.set_debug_vis(True)
+        self.leg_ids = self._robot.find_joints(list(spec.LEGS), preserve_order=True)[0]
+        self.arm_ids = self._robot.find_joints(list(spec.ARMS), preserve_order=True)[0]
+        if self._robot.num_joints != 18:
+            raise RuntimeError(f'Expected 18 active joints, got {self._robot.joint_names}; inspect USD conversion')
+        self.feet_ids = self._robot.find_bodies('.*_foot')[0]
+        self.feet_sensor_ids = self._contact.find_bodies('.*_foot')[0]
+        self.arm_sensor_ids = self._contact.find_bodies('link[1-8]|gripper_base|piper_base')[0]
+        self.body_sensor_ids = self._contact.find_bodies('base|.*_hip|.*_thigh')[0]
+        if len(self.feet_ids) != 4 or len(self.arm_sensor_ids) < 6:
+            raise RuntimeError('Missing feet/arm bodies after MJCF conversion')
+        self.motion = Motion(self.num_envs, self.device)
+        self.actions = torch.zeros((self.num_envs,12),device=self.device)
+        self.previous_actions = self.actions.clone()
+        self.older_actions = self.actions.clone()
+        self.leg_target = self.actions.clone()
+        self.default_leg = torch.tensor(spec.HOME_LEGS, device=self.device)
+        self.default_arm = torch.tensor(spec.HOME_ARM, device=self.device)
+        self.phase = torch.zeros((self.num_envs,4),device=self.device)
+        self.phase_offset = torch.tensor((0.,.5,.5,0.),device=self.device)
+        self.history = torch.zeros((self.num_envs,spec.HISTORY,spec.FRAME_SIZE),device=self.device)
+        self.history_version = torch.full((self.num_envs,), -1,device=self.device,dtype=torch.long)
+        self.arm_error_time = torch.zeros(self.num_envs,device=self.device)
+        self.velocity_distance = torch.zeros(self.num_envs,device=self.device)
+        self.episode_metrics = {}
+        self._initialized = False
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
-        self.scene.articulations["robot"] = self._robot
-        self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
-        self.scene.sensors["contact_sensor"] = self._contact_sensor
-
-        # we add a height scanner for perceptive locomotion
+        self.scene.articulations['robot'] = self._robot
+        self._contact = ContactSensor(self.cfg.contact_sensor)
+        self.scene.sensors['contact'] = self._contact
         self._height_scanner = RayCaster(self.cfg.height_scanner)
-        self.scene.sensors["height_scanner"] = self._height_scanner
-
-        # we add an imu
-        self._imu = Imu(self.cfg.imu)
-        self.scene.sensors["imu"] = self._imu
-
+        self.scene.sensors['height_scanner'] = self._height_scanner
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
-
-        # Filter arm contacts with the terrain and the quadruped on the source
-        # environment. The relationships are inherited by all cloned environments.
-        self._disable_arm_terrain_and_quadruped_collisions()
-        
-        # clone, filter, and replicate
         self.scene.clone_environments(copy_from_source=False)
         self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
-        
-        # add lights
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-        light_cfg.func("/World/Light", light_cfg)
+        # No broad arm-ground / arm-robot collision suppression.
+        light = sim_utils.DomeLightCfg(intensity=1500.)
+        light.func('/World/Light',light)
 
-    def _disable_arm_terrain_and_quadruped_collisions(self):
-        """Disable Piper collisions with the terrain and the rest of the robot."""
-        robot_prim_name = self.cfg.robot.prim_path.rsplit("/", maxsplit=1)[-1]
-        source_robot_path = f"{self.scene.env_prim_paths[0]}/{robot_prim_name}"
-        source_robot_prim = self.scene.stage.GetPrimAtPath(source_robot_path)
-        if not source_robot_prim.IsValid():
-            raise RuntimeError(f"Cannot filter arm collisions: invalid robot prim '{source_robot_path}'.")
+    def set_commands(self, commands):
+        """External high-level/evaluation commands, shape (N,5); disable random_commands."""
+        self.motion.set_commands(commands)
 
-        arm_body_prims = []
-        for body_name in self._ARM_BODY_NAMES:
-            body_path = f"{source_robot_path}/{body_name}"
-            body_prim = self.scene.stage.GetPrimAtPath(body_path)
-            if not body_prim.IsValid() or not body_prim.HasAPI(UsdPhysics.RigidBodyAPI):
-                raise RuntimeError(f"Cannot filter arm collisions: invalid rigid body prim '{body_path}'.")
-            arm_body_prims.append(body_prim)
-
-        quadruped_body_paths = [
-            prim.GetPath()
-            for prim in source_robot_prim.GetChildren()
-            if prim.HasAPI(UsdPhysics.RigidBodyAPI) and prim.GetName() not in self._ARM_BODY_NAMES
-        ]
-        if not quadruped_body_paths:
-            raise RuntimeError(f"Cannot filter arm collisions: no quadruped rigid bodies found below '{source_robot_path}'.")
-
-        filtered_target_paths = [Sdf.Path(self.cfg.terrain.prim_path), *quadruped_body_paths]
-
-        for body_prim in arm_body_prims:
-            filtered_pairs_api = UsdPhysics.FilteredPairsAPI.Apply(body_prim)
-            filtered_pairs_rel = filtered_pairs_api.CreateFilteredPairsRel()
-            for target_path in filtered_target_paths:
-                filtered_pairs_rel.AddTarget(target_path)
-
-    def _pre_physics_step(self, actions: torch.Tensor):
-        self._previous_previous_actions = self._previous_actions.clone()
-        self._previous_actions = self._actions.clone()
-        self._actions = actions.clone()
-        
-        # Clip the action
-        self._actions = torch.clamp(self._actions, -self.cfg.desired_clip_actions, self.cfg.desired_clip_actions)
-
-        # Filter the action
-        if(self.cfg.use_filter_actions):
-            alpha = 0.8
-            temp = alpha * self._actions + (1 - alpha) * self._previous_actions
-            #self._processed_actions = self.cfg.action_scale * temp + self._robot.data.default_joint_pos[:,0:12]
-            self._processed_actions = self.cfg.action_scale * temp + self._robot.data.default_joint_pos[:,self._ids_joints_order[0:12]]
-        else:
-            #self._processed_actions = self.cfg.action_scale * self._actions + self._robot.data.default_joint_pos[:,0:12]
-            self._processed_actions = self.cfg.action_scale * self._actions + self._robot.data.default_joint_pos[:,self._ids_joints_order[0:12]]
+    def _pre_physics_step(self, actions):
+        if not torch.isfinite(actions).all():
+            raise ValueError('Non-finite policy action')
+        self.older_actions[:] = self.previous_actions
+        self.previous_actions[:] = self.actions
+        self.actions[:] = actions.clamp(-spec.ACTION_CLIP,spec.ACTION_CLIP)
+        self.leg_target[:] = self.default_leg + spec.ACTION_SCALE*(
+            spec.ACTION_ALPHA*self.actions+(1-spec.ACTION_ALPHA)*self.previous_actions)
+        curriculum = min(1., .25+.75*self.common_step_counter/max(1,self.cfg.command_curriculum_steps))
+        self.motion.advance(self._robot.data.joint_pos[:,self.arm_ids],self.step_dt,
+            curriculum=curriculum,random_commands=self.cfg.random_commands,update_arm=self.cfg.arm_motion)
+        self.phase[:] = (self.phase+1.4*self.step_dt)%1.
+        self.velocity_distance += self.motion.commands[:,:2].norm(dim=-1)*self.step_dt
+        self.arm_error_time = torch.where(
+            (self._robot.data.joint_pos[:,self.arm_ids]-self.motion.arm).abs().amax(-1)>self.cfg.arm_tracking_limit,
+            self.arm_error_time+self.step_dt,0.)
 
     def _apply_action(self):
-        processed_actions_with_arm = torch.zeros(self.num_envs, 20, device=self.device)
-        processed_actions_with_arm[:, self._ids_only_arms_joints_order] = self._joints_arm_command_pos
-        processed_actions_with_arm[:, self._ids_only_legs_joints_order] = self._processed_actions
-        self._robot.set_joint_position_target(processed_actions_with_arm)
+        self._robot.set_joint_position_target(self.leg_target,joint_ids=self.leg_ids)
+        self._robot.set_joint_position_target(self.motion.arm,joint_ids=self.arm_ids)
 
+    def _get_observations(self):
+        moving = self.motion.commands[:,:3].norm(dim=-1) > .01
+        clocks = torch.where(moving[:,None],self.phase,-torch.ones_like(self.phase))
+        frame = torch.cat((self._robot.data.root_lin_vel_b,self._robot.data.root_ang_vel_b,
+            self._robot.data.projected_gravity_b,self.motion.commands,
+            self._robot.data.joint_pos[:,self.leg_ids]-self.default_leg,
+            self._robot.data.joint_vel[:,self.leg_ids],self.actions,clocks,
+            self._robot.data.joint_pos[:,self.arm_ids]-self.default_arm),dim=-1)
+        if frame.shape[-1] != spec.FRAME_SIZE:
+            raise RuntimeError('Policy ABI observation size mismatch')
+        # Repeated observation reads do not advance motion, phase, history or noise.
+        fresh = self.history_version != self.common_step_counter
+        if self.cfg.noise and fresh.any():
+            scale = torch.tensor([.04]*3+[.03]*3+[.01]*3+[0.]*5+[.01]*12+
+                                 [.1]*12+[0.]*12+[0.]*4+[.005]*6,device=self.device)
+            frame[fresh] += torch.randn_like(frame[fresh])*scale
+        self.history[fresh] = torch.cat((self.history[fresh,1:],frame[fresh,None]),dim=1)
+        self.history_version[fresh] = self.common_step_counter
+        return {'policy': self.history.flatten(start_dim=1)}
 
-    def _get_observations(self) -> dict:
-        
-        # Sample new commands if needed
-        custom_events._update_arm_trajectory(self)
-        custom_events._get_new_random_commands(self)
+    def ground_height(self):
+        heights = self._height_scanner.data.ray_hits_w[...,2]
+        valid = torch.isfinite(heights)
+        return torch.where(valid,heights,0.).sum(-1)/valid.sum(-1).clamp_min(1)
 
+    def metrics(self):
+        roll,pitch,_ = math_utils.euler_xyz_from_quat(self._robot.data.root_quat_w)
+        roll = torch.atan2(roll.sin(),roll.cos())
+        pitch = torch.atan2(pitch.sin(),pitch.cos())
+        forces = self._contact.data.net_forces_w_history.norm(dim=-1).amax(dim=1)
+        arm_contact = forces[:,self.arm_sensor_ids].amax(-1)>self.cfg.termination_contact_force
+        body_contact = forces[:,self.body_sensor_ids].amax(-1)>self.cfg.termination_contact_force
+        return dict(velocity_error=(self._robot.data.root_lin_vel_b[:,:2]-self.motion.commands[:,:2]).norm(dim=-1),
+            yaw_error=(self._robot.data.root_ang_vel_b[:,2]-self.motion.commands[:,2]).abs(),
+            pitch_error=(pitch-self.motion.commands[:,3]).abs(),roll=roll,pitch=pitch,
+            height_error=(self._robot.data.root_pos_w[:,2]-self.ground_height()-spec.BASE_HEIGHT-self.motion.commands[:,4]).abs(),
+            arm_contact=arm_contact,body_contact=body_contact,
+            arm_tracking_error=(self._robot.data.joint_pos[:,self.arm_ids]-self.motion.arm).abs().amax(-1))
 
-        # Observation --------------------------------------------------------------------------------------
-        clock_data = None
-        if(self.cfg.use_clock_signal):
-            self._phase_signal += self.step_dt * self._step_freq
-            self._phase_signal = self._phase_signal % 1.0
-            clock_data = torch.vstack([self._phase_signal[:,0], self._phase_signal[:,1], self._phase_signal[:,2], self._phase_signal[:,3]]).T
-            # all the envs that are not moving, we put -1
-            should_move = torch.norm(self._velocity_commands[:, :3], dim=1) > 0.01
-            clock_data[:, :] = clock_data[:, :]*should_move.unsqueeze(1).expand(-1, 4) + -1.0* ~should_move.unsqueeze(1).expand(-1, 4)
-            
-
-        # Choosing the main source of observation
-        if(self.cfg.use_concurrent_state_est):
-            # If concurrent SE/Learned State Estimator, we predict linear and angular vel from IMU
-            base_linear = custom_observations._get_concurrent_state_estimation(self)
-            base_ang_vel = self._imu.data.ang_vel_b
-            projected_gravity_b = self._imu.data.projected_gravity_b
-        elif(self.cfg.use_imu):
-            # Using directly the IMU
-            base_linear = self._imu.data.lin_acc_b
-            base_ang_vel = self._imu.data.ang_vel_b
-            projected_gravity_b = self._imu.data.projected_gravity_b
-        else:
-            #Using a model-based state estimation
-            base_linear = self._robot.data.root_lin_vel_b
-            base_ang_vel = self._robot.data.root_ang_vel_b
-            projected_gravity_b = self._robot.data.projected_gravity_b
-        
-        
-        # Standard Obs for the Actor/Critic
-        obs = torch.cat(
-            [
-                tensor
-                for tensor in (
-                    base_linear,
-                    base_ang_vel,
-                    projected_gravity_b,
-                    self._velocity_commands,
-                    self._pose_commands,
-                    self._robot.data.joint_pos[:,self._ids_only_legs_joints_order] - self._robot.data.default_joint_pos[:,self._ids_only_legs_joints_order],
-                    self._robot.data.joint_vel[:,self._ids_only_legs_joints_order],
-                    self._actions,
-                    clock_data,
-                    self._robot.data.joint_pos[:,self._ids_only_arms_joints_order] - self._robot.data.default_joint_pos[:,self._ids_only_arms_joints_order]
-                )
-                if tensor is not None
-            ],
-            dim=-1,
-        )
-
-        if(self.cfg.use_observation_history):
-            #the bottom element is the newest observation!!
-            self._observation_history = torch.cat((self._observation_history[:,1:,:], obs.unsqueeze(1)), dim=1)
-            obs = torch.flatten(self._observation_history, start_dim=1)
-
-        observations = {"proprioceptive": obs}
-
-        # Add heightmap data to obs if needed
-        if(getattr(self.cfg, "use_vision", False)):
-            height_data = (
-                self._height_scanner.data.pos_w[:, 2].unsqueeze(1) - self._height_scanner.data.ray_hits_w[..., 2] - 0.5
-            )
-            height_data = torch.nan_to_num(height_data, nan=0.0, posinf=1.0, neginf=-1.0)
-            height_data = height_data.clip(-1.0, 1.0)
-            obs = torch.cat((obs, height_data), dim=-1)      
-        
-
-        # Critic OBS could be different if needed
-        if(self.cfg.use_asymmetric_ppo):
-            obs_critic = custom_observations._get_privileged_observation(self)
-            observations["critic"] = torch.cat((obs, obs_critic), dim=-1)
-
-
-        # If RMA, we add some other predicted obs AFTER the critic asymmetric obs to avoid duplication
-        if(self.cfg.use_rma):
-            # Predict the RMA observation
-            obs_rma = custom_observations._get_rma(self)
-            obs = torch.cat((obs, obs_rma), dim=-1)
-
-        # Actor OBS - here after the critic to avoid duplication with rma obs
-        # if asymmetric ppo is used
-        observations["policy"] = obs    
-
-        return observations
-
-
-    def _get_rewards(self) -> torch.Tensor:
-
-        track_height_exp = custom_rewards.track_height_exp(self)
-        track_lin_vel_xy_exp = custom_rewards.track_lin_vel_xy_exp(self)
-        track_lin_vel_z_l2 = custom_rewards.track_lin_vel_z_l2(self)
-        track_orientation_l2 = custom_rewards.track_orientation_l2(self)
-        track_ang_vel_xy_l2 = custom_rewards.track_ang_vel_xy_l2(self)
-        track_ang_vel_z_exp = custom_rewards.track_ang_vel_z_exp(self)
-
-        undesired_contacts = custom_rewards.undesired_contacts(self)
-        action_rate_l2 = custom_rewards.action_rate_l2(self)
-        action_smoothness_l2 = custom_rewards.action_smoothness_l2(self)
-
-        joints_hip_pos_l2 = custom_rewards.joints_hip_pos_l2(self)
-        joints_thigh_pos_l2 = custom_rewards.joints_thigh_pos_l2(self)
-        joints_calf_pos_l2 = custom_rewards.joints_calf_pos_l2(self)
-        joints_acc_l2 = custom_rewards.joints_acc_l2(self)
-        joints_torques_l2 = custom_rewards.joints_torques_l2(self)
-        joints_energy_l1 = custom_rewards.joints_energy_l1(self)
-
-        feet_air_time = custom_rewards.feet_air_time(self)
-        feet_air_time_variance = custom_rewards.feet_air_time_variance(self)
-
-        feet_slide = custom_rewards.feet_slide(self)
-        feet_edge = custom_rewards.feet_edge(self)
-        periodic_contact_suggestion = custom_rewards.periodic_contact_suggestion(self)
-        stance_contact_suggestion = custom_rewards.stance_contact_suggestion(self)
-        feet_height_clearance_mujoco_aperiodic = custom_rewards.feet_height_clearance_mujoco_aperiodic(self)
-        feet_height_clearance_mujoco_periodic = custom_rewards.feet_height_clearance_mujoco_periodic(self)
-        feet_height_clearance_periodic = custom_rewards.feet_height_clearance_periodic(self)
-        feet_height_clearance_aperiodic = custom_rewards.feet_height_clearance_aperiodic(self)
-        feet_to_hip_distance_l2 = custom_rewards.feet_to_hip_distance_l2(self)
-        feet_vertical_surface_contacts = custom_rewards.feet_vertical_surface_contacts(self)
-
-        rewards = {
-            "track_height_exp": track_height_exp * self.cfg.height_reward_scale * self.step_dt,
-            "track_lin_vel_xy_exp": track_lin_vel_xy_exp * self.cfg.lin_vel_reward_scale * self.step_dt,
-            "track_lin_vel_z_l2": track_lin_vel_z_l2 * self.cfg.z_vel_reward_scale * self.step_dt,
-            "track_orientation_l2": track_orientation_l2 * self.cfg.orientation_reward_scale * self.step_dt,
-            "track_ang_vel_xy_l2": track_ang_vel_xy_l2 * self.cfg.ang_vel_reward_scale * self.step_dt,
-            "track_ang_vel_z_exp": track_ang_vel_z_exp * self.cfg.yaw_rate_reward_scale * self.step_dt,
-
-            "undesired_contacts": undesired_contacts * self.cfg.undersired_contact_reward_scale * self.step_dt,
-            "action_rate_l2": action_rate_l2 * self.cfg.action_rate_reward_scale * self.step_dt,
-            "action_smoothness_l2": action_smoothness_l2 * self.cfg.action_smoothness_reward_scale * self.step_dt,
-
-            "joints_hip_pos_l2": joints_hip_pos_l2 * self.cfg.joints_hip_position_reward_scale * self.step_dt,
-            "joints_thigh_pos_l2": joints_thigh_pos_l2 * self.cfg.joints_thigh_position_reward_scale * self.step_dt,
-            "joints_calf_pos_l2": joints_calf_pos_l2 * self.cfg.joints_calf_position_reward_scale * self.step_dt,
-            "joints_acc_l2": joints_acc_l2 * self.cfg.joints_accel_reward_scale * self.step_dt,
-            "joints_torques_l2": joints_torques_l2 * self.cfg.joints_torque_reward_scale * self.step_dt,
-            "joints_energy_l1": joints_energy_l1 * self.cfg.joints_energy_reward_scale * self.step_dt,
-
-            "feet_air_time": feet_air_time * self.cfg.feet_air_time_reward_scale * self.step_dt,
-            "feet_air_time_variance": feet_air_time_variance * self.cfg.feet_air_time_variance_reward_scale * self.step_dt,
-            
-            "feet_height_clearance_aperiodic": feet_height_clearance_aperiodic * self.cfg.feet_height_clearance_aperiodic_reward_scale * self.step_dt,
-            "feet_height_clearance_periodic": feet_height_clearance_periodic * self.cfg.feet_height_clearance_periodic_reward_scale * self.step_dt,
-            "feet_height_clearance_mujoco_aperiodic": feet_height_clearance_mujoco_aperiodic * self.cfg.feet_height_clearance_mujoco_aperiodic_reward_scale * self.step_dt,
-            "feet_height_clearance_mujoco_periodic": feet_height_clearance_mujoco_periodic * self.cfg.feet_height_clearance_mujoco_periodic_reward_scale * self.step_dt,
-            
-            "feet_slide": feet_slide * self.cfg.feet_slide_reward_scale * self.step_dt,
-            "feet_to_hip_distance_l2": feet_to_hip_distance_l2 * self.cfg.feet_to_hip_distance_reward_scale * self.step_dt,
-            "feet_edge": feet_edge * self.cfg.feet_edge_reward_scale * self.step_dt,
-            "feet_vertical_surface_contacts": feet_vertical_surface_contacts * self.cfg.feet_vertical_surface_contacts_reward_scale * self.step_dt,
-
-            "periodic_contact_suggestion": periodic_contact_suggestion * self.cfg.periodic_contact_suggestion_reward_scale * self.step_dt,
-            "stance_contact_suggestion": stance_contact_suggestion * self.cfg.stance_contact_suggestion_reward_scale * self.step_dt,
-            
-        }
-        reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
-
-        # Check for NaNs and Infs
-        if torch.isnan(reward).any() or torch.isinf(reward).any():
-            print("NaN or Inf detected in reward computation. Setting reward to zero for affected environments.")
-            breakpoint()  # For debugging purposes
-            reward = torch.where(torch.isnan(reward) | torch.isinf(reward), torch.zeros_like(reward), reward)
-        
-        # Logging
-        for key, value in rewards.items():
-            self._episode_sums[key] += value
+    def _get_rewards(self):
+        m = self.metrics()
+        moving = self.motion.commands[:,:3].norm(dim=-1)>.01
+        foot_contact = self._contact.data.net_forces_w[:,self.feet_sensor_ids].norm(dim=-1)>5.
+        stance = (self.phase < .65) | ~moving[:,None]
+        contact_match = (foot_contact==stance).float().mean(-1)
+        foot_height = self._robot.data.body_pos_w[:,self.feet_ids,2]-self.ground_height()[:,None]
+        swing = (~stance).float()
+        clearance = ((foot_height-.06).square()*swing).mean(-1)
+        dq = self._robot.data.joint_vel[:,self.leg_ids]
+        tau = self._robot.data.applied_torque[:,self.leg_ids]
+        terms = dict(velocity=2.*torch.exp(-m['velocity_error'].square()/.10),
+            yaw=.5*torch.exp(-m['yaw_error'].square()/.25),
+            pitch=1.5*torch.exp(-m['pitch_error'].square()/.015),
+            height=1.5*torch.exp(-m['height_error'].square()/.0025),
+            roll=-2.*m['roll'].square(), vertical_velocity=-1.*self._robot.data.root_lin_vel_b[:,2].square(),
+            angular_velocity=-.1*self._robot.data.root_ang_vel_b[:,:2].square().sum(-1),
+            contacts=-2.*(m['arm_contact'].float()+m['body_contact'].float()),
+            gait=.5*contact_match,clearance=-5.*clearance,
+            torque=-2.5e-6*tau.square().sum(-1),energy=-1.e-4*(tau*dq).abs().sum(-1),
+            action_rate=-.01*(self.actions-self.previous_actions).square().sum(-1),
+            action_smoothness=-.001*(self.actions-2*self.previous_actions+self.older_actions).square().sum(-1))
+        if not self.episode_metrics:
+            self.episode_metrics = {k:torch.zeros(self.num_envs,device=self.device) for k in terms}
+        for key,value in terms.items():
+            self.episode_metrics[key] += value*self.step_dt
+        reward = sum(terms.values())*self.step_dt
+        if not torch.isfinite(reward).all():
+            raise RuntimeError('Non-finite reward; inspect simulator/model instead of hiding failure')
         return reward
 
+    def _get_dones(self):
+        m = self.metrics()
+        clearance = self._robot.data.root_pos_w[:,2]-self.ground_height()
+        fallen = (m['roll'].abs()>.8)|(m['pitch'].abs()>.8)|(clearance<self.cfg.min_ground_clearance)
+        finite = torch.isfinite(self._robot.data.root_state_w).all(-1) & torch.isfinite(self._robot.data.joint_pos).all(-1)
+        terminated = fallen|m['arm_contact']|m['body_contact']|self.motion.fault|(self.arm_error_time>.5)|~finite
+        return terminated, self.episode_length_buf>=self.max_episode_length-1
 
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        net_contact_forces = self._contact_sensor.data.net_forces_w_history
-        died_check_base = torch.any(torch.max(torch.norm(net_contact_forces[:, :, self._base_contact_sensor_id], dim=-1), dim=1)[0] > 1.0, dim=1)
-        died_check_hips = torch.any(torch.max(torch.norm(net_contact_forces[:, :, self._hip_contact_sensor_ids], dim=-1), dim=1)[0] > 1.0, dim=1) 
-        died = torch.logical_or(died_check_base, died_check_hips)
-        return died, time_out
-
-
-    def _reset_idx(self, env_ids: torch.Tensor | None):
-        if env_ids is None or len(env_ids) == self.num_envs:
+    def _reset_idx(self, env_ids):
+        if env_ids is None:
             env_ids = self._robot._ALL_INDICES
-
-
+        # Curriculum: move up only after commanded travel; never reward standing for progression.
+        if self._initialized and self.cfg.terrain.terrain_type=='generator':
+            distance = (self._robot.data.root_pos_w[env_ids,:2]-self._terrain.env_origins[env_ids,:2]).norm(dim=-1)
+            completed = self.episode_length_buf[env_ids]>=self.max_episode_length-1
+            up = completed & (distance>2.) & (distance>.7*self.velocity_distance[env_ids])
+            down = ~completed
+            self._terrain.update_env_origins(env_ids,up,down)
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
-        if len(env_ids) == self.num_envs: 
-            # Spread out the resets to avoid spikes in training when many environments reset at a similar time
-            self.episode_length_buf[:] = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
-        self._actions[env_ids] = 0.0
-        self._previous_actions[env_ids] = 0.0
-        self._previous_previous_actions[env_ids] = 0.0
-        
-        # Reset commands
-        custom_events._get_new_random_commands(self, env_ids)
-
-        # Reset swing peak
-        self._swing_peak[env_ids] = torch.tensor([0.0, 0.0, 0.0, 0.0], device=self.device)
-        self._swing_peak_periodic[env_ids] = torch.tensor([0.0, 0.0, 0.0, 0.0], device=self.device)
-        
-        # Reset contact periodic
-        self._phase_signal[env_ids] = self._phase_offset[env_ids].clone()# + self.step_dt * self._step_freq * torch.rand(env_ids.shape[0], 1, device=self.device)*10.
-        self._phase_signal[env_ids] = self._phase_signal[env_ids]  % 1.0
-
-        # Reset observation history
-        self._observation_history[env_ids] *= 0.0
-
-        # Reset obs and noise concurrent
-        if(self.cfg.use_concurrent_state_est):
-            self._observation_history_concurrent_state_est[env_ids] *= 0.0
-            if self.cfg.observation_noise_model:
-                self._observation_noise_model_concurrent_state_est.reset(env_ids)
-        
-        # Reset obs and noise rma
-        if(self.cfg.use_rma):
-            self._observation_history_rma[env_ids] *= 0.0
-            if self.cfg.observation_noise_model:
-                self._observation_noise_model_rma.reset(env_ids)
-
-
-        # Reset robot state
-        joint_pos = self._robot.data.default_joint_pos[env_ids]
-        joint_pos[:, self._ids_only_arms_joints_order] += torch.zeros_like(joint_pos[:, self._ids_only_arms_joints_order]).uniform_(-3.14, 3.14)
-        joint_pos[:, self._ids_only_legs_joints_order] += torch.zeros_like(joint_pos[:, self._ids_only_legs_joints_order]).uniform_(-0.2, 0.2)
-        # we need to project them inside the robots limits (only arms!)
-        joints_limits = self._robot.data.default_joint_pos_limits
-        joints_arm_limits = joints_limits[:,self._ids_only_arms_joints_order]
-        joint_pos[:, self._ids_only_arms_joints_order] = torch.clamp(joint_pos[:, self._ids_only_arms_joints_order], joints_arm_limits[0,:,0], joints_arm_limits[0,:,1])
-
-        # Start from the reset pose and sample an independent target trajectory for each environment.
-        self._joints_arm_command_pos[env_ids] = joint_pos[:, self._ids_only_arms_joints_order]
-        custom_events._sample_arm_trajectory(self, env_ids)
-        
-        joint_vel = self._robot.data.default_joint_vel[env_ids]
-        
-        default_root_state = self._robot.data.default_root_state[env_ids]
-        default_root_state[:, :3] += self._terrain.env_origins[env_ids]
-        default_root_state[:, 3:7] = math_utils.random_yaw_orientation(env_ids.shape[0], device=self.device)
-        self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-        self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-        
-        # Logging
-        extras = dict()
-        for key in self._episode_sums.keys():
-            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
-            self._episode_sums[key][env_ids] = 0.0
-        self.extras["log"] = dict()
-        self.extras["log"].update(extras)
-        extras = dict()
-        extras["Episode_Termination/base_contact"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        
-        if(self._terrain.cfg.terrain_generator is not None and self._terrain.cfg.terrain_generator.curriculum == True):
-            extras["Episode_Curriculum/terrain_levels"] = torch.mean(self._terrain.terrain_levels.float())
-        
-        self.extras["log"].update(extras)
+        self.motion.reset(env_ids,random_arm=self.cfg.random_arm)
+        q = self._robot.data.default_joint_pos[env_ids].clone()
+        dq = torch.zeros_like(q)
+        q[:,self.arm_ids] = self.motion.arm[env_ids]
+        q[:,self.leg_ids] = self.default_leg
+        root = self._robot.data.default_root_state[env_ids].clone()
+        root[:,:3] += self._terrain.env_origins[env_ids]
+        root[:,7:] = 0
+        self._robot.write_root_pose_to_sim(root[:,:7],env_ids)
+        self._robot.write_root_velocity_to_sim(root[:,7:],env_ids)
+        self._robot.write_joint_state_to_sim(q,dq,env_ids=env_ids)
+        self._robot.set_joint_position_target(q,env_ids=env_ids)
+        self.actions[env_ids] = 0
+        self.previous_actions[env_ids] = 0
+        self.older_actions[env_ids] = 0
+        self.leg_target[env_ids] = self.default_leg
+        self.phase[env_ids] = self.phase_offset
+        self.history[env_ids] = 0
+        self.history_version[env_ids] = -1
+        self.arm_error_time[env_ids] = 0
+        self.velocity_distance[env_ids] = 0
+        self.extras['log'] = {}
+        for key,value in self.episode_metrics.items():
+            self.extras['log']['Reward/'+key] = value[env_ids].mean()/self.max_episode_length_s
+            value[env_ids] = 0
+        if self.cfg.terrain.terrain_type=='generator':
+            self.extras['log']['Curriculum/terrain_level'] = self._terrain.terrain_levels.float().mean()
+        self._initialized = True

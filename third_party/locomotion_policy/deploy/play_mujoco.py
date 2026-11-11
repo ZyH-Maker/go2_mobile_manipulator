@@ -1,242 +1,158 @@
-# Description: This script is used to simulate the full model of the robot in mujoco
-
-import time
-import numpy as np
-
-
+"""Standard PiPER sim2sim: explicit policy bundle, flat/rough, five commands, JSON metrics."""
+import argparse
+import json
+from pathlib import Path
 import sys
-import os 
-file_path = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(file_path+"/mujoco/")
-sys.path.append(file_path+"/../")
-sys.path.append(file_path+"/../scripts/rsl_rl")
-
-
-# Gym and Simulation related imports
+import time
+import math
+import numpy as np
 import mujoco
-import mujoco.viewer
-import mujoco_utils
-from heightmap import HeightMap
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
+import policy_contract as spec
+from motion import Motion
+from standard_runtime import StandardPolicy, observation
 
 
-# Trash Policy imports
-from locomotion_policy_wrapper import LocomotionPolicyWrapper
-from ik_mink import IKMink
+def rollout(args, commands, case):
+    np.random.seed(args.seed); torch.manual_seed(args.seed)
+    model = mujoco.MjModel.from_xml_path(str(spec.MODEL.parent/f'scene_standard_{args.terrain}.xml'))
+    data = mujoco.MjData(model)
+    legs = [model.joint(n).qposadr[0] for n in spec.LEGS]
+    leg_v = [model.joint(n).dofadr[0] for n in spec.LEGS]
+    arms = [model.joint(n).qposadr[0] for n in spec.ARMS]
+    arm_v = [model.joint(n).dofadr[0] for n in spec.ARMS]
+    leg_act = [model.actuator(n).id for n in spec.LEGS]
+    arm_act = [model.actuator(n).id for n in spec.ARMS]
+    arm_body = {model.body(n).id for n in ('piper_base','gripper_base',*(f'link{i}' for i in range(1,9)))}
+    foot_body = {model.body(n+'_foot').id for n in ('FL','FR','RL','RR')}
+    payload_id = model.body('payload').id
+    model.body_inertia[payload_id] *= args.payload/model.body_mass[payload_id]
+    model.body_mass[payload_id] = args.payload
+    mujoco.mj_setConst(model,data)
+    data.qpos[2] = .32; data.qpos[3] = 1.
+    data.qpos[legs] = spec.HOME_LEGS; data.qpos[arms] = spec.HOME_ARM
+    mujoco.mj_forward(model,data)
+    motion = Motion(1,'cpu'); motion.reset(torch.tensor([0]),random_arm=False)
+    policy = None if args.model_only else StandardPolicy(args.policy)
+    phase = np.array([0.,.5,.5,0.])
+    metrics = []; failure = None; collision_pairs = []
+    arm_error_time = 0.
+    viewer = None
+    if args.viewer:
+        from mujoco import viewer as mjviewer
+        viewer = mjviewer.launch_passive(model,data)
+    previous_target = np.array(spec.HOME_LEGS)
+    try:
+        for step in range(round(args.seconds/spec.CONTROL_DT)):
+            start = time.monotonic()
+            rotation = data.xmat[model.body('base').id].reshape(3,3)
+            clocks = phase if motion.commands[0,:3].norm()>.01 else np.full(4,-1.)
+            previous = np.zeros(12) if policy is None else policy.previous
+            frame = observation(rotation.T@data.qvel[:3],data.qvel[3:6],rotation.T@np.array([0.,0.,-1.]),
+                motion.commands[0].numpy(),data.qpos[legs],data.qvel[leg_v],previous,clocks,data.qpos[arms])
+            target = np.array(spec.HOME_LEGS) if policy is None else policy.infer(frame)
+            # First settle at zero commands, then ramp to the requested case.
+            requested = np.zeros(5) if data.time<args.settle else np.array(commands)
+            motion.set_commands(torch.tensor(requested,dtype=torch.float32).reshape(1,5))
+            motion.advance(torch.tensor(data.qpos[arms],dtype=torch.float32).reshape(1,6),spec.CONTROL_DT,
+                random_commands=False,update_arm=not args.hold_arm)
+            phase = (phase+1.4*spec.CONTROL_DT)%1.
+            for sub in range(spec.DECIMATION):
+                delayed = previous_target if args.motor_delay and sub==0 else target
+                kp,kd = (60.,5.) if args.model_only else (spec.LEG_KP,spec.LEG_KD)
+                leg_tau = kp*(delayed-data.qpos[legs])-kd*data.qvel[leg_v]
+                data.ctrl[leg_act] = np.clip(leg_tau,model.actuator_ctrlrange[leg_act,0],model.actuator_ctrlrange[leg_act,1])
+                data.ctrl[arm_act] = motion.arm[0].numpy()
+                mujoco.mj_step(model,data)
+            previous_target = target.copy()
+            rotation = data.xmat[model.body('base').id].reshape(3,3)
+            pitch = math.asin(np.clip(-rotation[2,0],-1,1))
+            roll = math.atan2(rotation[2,1],rotation[2,2])
+            ground_hits = []
+            for x in np.linspace(-.3,.3,7):
+                for y in np.linspace(-.3,.3,7):
+                    yaw = math.atan2(rotation[1,0],rotation[0,0])
+                    point = data.qpos[:3]+np.array([math.cos(yaw)*x-math.sin(yaw)*y,
+                        math.sin(yaw)*x+math.cos(yaw)*y,1.])
+                    geomid = np.array([-1],dtype=np.int32)
+                    # Group 0 is terrain only; all robot collisions are group 3.
+                    ray = mujoco.mj_ray(model,data,point,np.array([0.,0.,-1.]),np.array([1,0,0,0,0,0],dtype=np.uint8),1,-1,geomid)
+                    if ray>=0: ground_hits.append(point[2]-ray)
+            ground = float(np.mean(ground_hits)) if ground_hits else float('nan')
+            contacts = False
+            for contact_id, contact in enumerate(data.contact):
+                a,b = int(model.geom_bodyid[contact.geom1]),int(model.geom_bodyid[contact.geom2])
+                force = np.zeros(6); mujoco.mj_contactForce(model,data,contact_id,force)
+                if np.linalg.norm(force[:3])>5.:
+                    if a in arm_body or b in arm_body or (a==0 and b not in foot_body) or (b==0 and a not in foot_body):
+                        contacts = True
+                        collision_pairs.append([model.body(a).name,model.body(b).name])
+            command = motion.commands[0].numpy()
+            if data.time>args.settle+2.:
+                velocity = rotation.T@data.qvel[:3]
+                metrics.append([np.linalg.norm(velocity[:2]-command[:2]),abs(data.qvel[5]-command[2]),
+                    abs(pitch-command[3]),abs(data.qpos[2]-ground-spec.BASE_HEIGHT-command[4]),
+                    np.max(np.abs(data.qpos[arms]-motion.arm[0].numpy()))])
+            arm_error_time = arm_error_time+spec.CONTROL_DT if np.max(np.abs(data.qpos[arms]-motion.arm[0].numpy()))>.12 else 0.
+            if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all() or not np.isfinite(ground):failure='nonfinite'
+            elif abs(roll)>.8 or abs(pitch)>.8 or data.qpos[2]-ground<.08:failure='fall'
+            elif contacts:failure='undesired_contact'
+            elif motion.fault.item():failure='arm_arrival_timeout'
+            elif arm_error_time>.5:failure='arm_tracking_error'
+            if failure:break
+            if viewer:
+                if not viewer.is_running():break
+                viewer.sync()
+            if args.realtime or viewer:
+                time.sleep(max(0.,spec.CONTROL_DT-(time.monotonic()-start)))
+    finally:
+        if viewer:viewer.close()
+    values = np.array(metrics)
+    rms = np.sqrt(np.mean(values**2,axis=0)).tolist() if len(values) else None
+    passed = failure is None and rms is not None and all(v<t for v,t in zip(rms,[.25,.2,.12,.04,.06]))
+    if args.model_only:
+        passed = failure is None and rms is not None
+    return dict(case=case,terrain=args.terrain,commands=commands,seed=args.seed,payload_kg=args.payload,
+        simulated_seconds=float(data.time),failure=failure,collision_pairs=collision_pairs,
+        rmse=dict(zip(['velocity_m_s','yaw_rad_s','pitch_rad','height_m','arm_rad'],rms)) if rms else None,
+        passed=passed,kind='model_pd_smoke' if args.model_only else 'policy_sim2sim')
 
 
-import config
-import threading
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--policy',type=Path,help='Export directory containing ONNX and policy_contract.json')
+    p.add_argument('--terrain',choices=['flat','rough'],default='flat')
+    p.add_argument('--commands',type=float,nargs=5,default=[0.,0.,0.,0.,0.],metavar=('VX','VY','WZ','PITCH','DH'))
+    p.add_argument('--seconds',type=float,default=20.)
+    p.add_argument('--settle',type=float,default=2.)
+    p.add_argument('--seed',type=int,default=42)
+    p.add_argument('--payload',type=float,default=.1)
+    p.add_argument('--motor-delay',type=int,choices=[0,1],default=1)
+    p.add_argument('--viewer',action='store_true')
+    p.add_argument('--realtime',action='store_true')
+    p.add_argument('--hold-arm',action='store_true')
+    p.add_argument('--model-only',action='store_true',help='PD smoke only; does not validate any learned policy')
+    p.add_argument('--suite',action='store_true')
+    p.add_argument('--report',type=Path,default=ROOT/'reports/sim2sim.json')
+    args=p.parse_args()
+    if not args.model_only and not args.policy:p.error('--policy required unless --model-only')
+    if args.seconds<=args.settle+2 or args.payload<=0:p.error('seconds must exceed settle+2; payload must be positive')
+    if not np.isfinite(args.commands).all() or np.any(np.array(args.commands)<spec.COMMAND_LOW) or np.any(np.array(args.commands)>spec.COMMAND_HIGH):
+        p.error('commands outside policy training ranges')
+    cases=[('custom',args.commands)] if not args.suite else [
+        ('stand',[0,0,0,0,0]),('pitch_forward',[0,0,0,.2,0]),('pitch_back',[0,0,0,-.2,0]),
+        ('lower',[0,0,0,0,-.06]),('pose_combined',[0,0,0,.15,-.05]),
+        ('forward',[.2,0,0,0,0]),('backward',[-.15,0,0,0,0]),
+        ('lateral',[0,.1,0,0,0]),('turn',[0,0,.2,0,0]),('walk_pose',[.1,0,.1,.1,-.03])]
+    results=[rollout(args,commands,name) for name,commands in cases]
+    args.report.parent.mkdir(parents=True,exist_ok=True)
+    args.report.write_text(json.dumps(results,indent=2,allow_nan=False)+'\n')
+    print(json.dumps(results,indent=2,allow_nan=False))
+    return 0 if all(x['passed'] for x in results) else 1
 
 
-class PlayMujoco:
-    def __init__(self):
-        np.set_printoptions(precision=3, suppress=True)
-
-        self.simulation_dt = 0.002
-
-
-        # Load the model and data.
-        self.mjModel = mujoco.MjModel.from_xml_path(file_path + "/mujoco/models/scene_rough.xml")
-        self.mjData = mujoco.MjData(self.mjModel)
-        keyframe_id = mujoco.mj_name2id(self.mjModel, mujoco.mjtObj.mjOBJ_KEY, "home")
-        self.mjData.qpos = self.mjModel.key_qpos[keyframe_id]
-        self.viewer = mujoco.viewer.launch_passive(
-                        self.mjModel,
-                        self.mjData,
-                        show_left_ui=False,
-                        show_right_ui=False,
-                        #key_callback=lambda x: self._key_callback(x),
-                    )
-        
-        joint_names = [
-            "joint1",
-            "joint2",
-            "joint3",
-            "joint4",
-            "joint5",
-            "joint6",
-        ]
-        self.arm_dof_ids = np.array([self.mjModel.joint(name).id for name in joint_names])
-        
-        mujoco.mjv_defaultFreeCamera(self.mjModel, self.viewer.cam)
-        self.last_render_time = time.time()
-        self.RENDER_FREQ = 30.0  # Hz 
-
-
-        # Initialization of variables used in the main control loop --------------------------------
-        self.locomotion_policy = LocomotionPolicyWrapper(mjModel=self.mjModel)
-        self.ik_mink_solver = IKMink()
-
-        if(self.locomotion_policy.use_vision):
-            resolution_heightmap = config.resolution_heightmap
-            num_rows_heightmap = round(config.size_x_heightmap/resolution_heightmap) + 1
-            num_cols_heightmap = round(config.size_y_heightmap/resolution_heightmap) + 1
-            self.heightmap = HeightMap(num_rows=num_rows_heightmap, num_cols=num_cols_heightmap, dist_x=resolution_heightmap, dist_y=resolution_heightmap, mj_model=mjModel, mj_data=mjData) 
-
-        self.arm_joints_position = np.zeros(6)  # 6 arm joints 
-        self.arm_joints_velocity = np.zeros(6)  # 6 arm joints
-        self.legs_joints_position = np.zeros(12)  # 12 leg joints
-        self.legs_joints_velocity = np.zeros(12)  # 12 leg joints
-        
-        self.desired_joint_pos_leg = self.mjData.qpos[7:19] 
-        self.desired_joint_pos_arm = self.mjData.qpos[19:25] 
-        self.desired_joint_pos_gripper = 0.0
-        self.desired_pose_command_overwrite = np.zeros(2)
-        self.Kp_legs = 0
-        self.Kd_legs = 0
-        self.Kp_arm = config.Kp_arm
-        self.Kd_arm = config.Kd_arm
-        self.Kp_gripper = config.Kp_gripper
-        self.Kd_gripper = config.Kd_gripper
-
-
-        # --------------------------------------------------------------
-        self.ref_base_lin_vel_H = np.array([0.0, 0.0, 0.0])  # Desired base linear velocity in the horizontal plane (x, y, z)
-        self.ref_base_ang_yaw_dot = 0.0  # Desired base angular velocity around the vertical axis
-
-        # Interactive Command Line
-        from console import Console
-        self.console = Console(controller_node=self)
-        thread_console = threading.Thread(target=self.console.interactive_command_line)
-        thread_console.daemon = True
-        thread_console.start()
-
-        self.console.isDown = False  # Only in this play_mujoco script
-        self.console.isRLActivated = True  # Only in this play_mujoco script
-
-
-    def run(self):
-        step_num = 1
-        # Run the simulation
-        while self.viewer.is_running():
-            step_start = time.time()
-            
-            # Get the current state of the robot -----------------------------------------------------
-            qpos, qvel = self.mjData.qpos, self.mjData.qvel
-            base_lin_vel = mujoco_utils.base_lin_vel(self.mjData, frame='base')
-            base_ang_vel = mujoco_utils.base_ang_vel(self.mjData, frame='base')
-            base_ori_euler_xyz = mujoco_utils.base_ori_euler_xyz(self.mjData)
-            heading_orientation_SO3 = mujoco_utils.heading_orientation_SO3(self.mjData)
-            base_quat_wxyz = qpos[3:7]
-            base_pos = mujoco_utils.base_pos(self.mjData)
-
-            joints_pos_leg = qpos[7:19]
-            joints_pos_arm = qpos[19:25]
-            joints_pos_gripper = qpos[25]
-
-            joints_vel_leg = qvel[6:18]
-            joints_vel_arm = qvel[18:24]
-            joints_vel_gripper = qvel[24]
-
-            if(config.training_env["use_imu"] or config.training_env["use_concurrent_state_est"]):
-                imu_linear_acceleration = self.mjData.sensordata[0:3]
-                imu_angular_velocity = self.mjData.sensordata[3:6]
-                imu_orientation = self.mjData.sensordata[9:13]
-                #imu_orientation = base_quat_wxyz
-            else:
-                imu_linear_acceleration = np.zeros(3)
-                imu_angular_velocity = np.zeros(3)
-                imu_orientation = np.zeros(4)
-        
-            ref_base_lin_vel, ref_base_ang_vel = mujoco_utils.target_base_vel(self.mjData, self.ref_base_lin_vel_H, self.ref_base_ang_yaw_dot, frame='world')
-
-
-            if(self.locomotion_policy.use_vision):
-                self.heightmap.update_height_map(self.mjData.qpos[0:3], yaw=base_ori_euler_xyz[2])
-
-
-            # IK controller --------------------------------------------------------------
-            """reference_base_pose, \
-                reference_joints_position, \
-                ik_succeded = self.ik_mink_solver.compute(target_pos, target_quat, initial_joints_position, 
-                                                        initial_base_pose, optimize_height=True, optimize_pitch=True)"""
-
-            # RL controller --------------------------------------------------------------
-            if self.console.isRLActivated and step_num % round(1 / (self.locomotion_policy.RL_FREQ * self.simulation_dt)) == 0:            
-                
-                """reference_base_pose, \
-                    reference_joints_position, \
-                    ik_succeded = self.ik_mink_solver.compute(target_pos, target_quat, initial_joints_position, 
-                                                            initial_base_pose, optimize_height=True, optimize_pitch=True)"""
-
-                self.desired_joint_pos_leg = self.locomotion_policy.compute_control(
-                            base_pos=base_pos, 
-                            base_ori_euler_xyz=base_ori_euler_xyz, 
-                            base_quat_wxyz=base_quat_wxyz,
-                            base_lin_vel=base_lin_vel, 
-                            base_ang_vel=base_ang_vel,
-                            heading_orientation_SO3=heading_orientation_SO3,
-                            joints_pos_leg=joints_pos_leg, 
-                            joints_vel_leg=joints_vel_leg,
-                            joints_pos_arm=joints_pos_arm,
-                            ref_base_lin_vel=ref_base_lin_vel, 
-                            ref_base_ang_vel=ref_base_ang_vel,
-                            ref_pose_command=self.desired_pose_command_overwrite,
-                            imu_linear_acceleration=imu_linear_acceleration,
-                            imu_angular_velocity=imu_angular_velocity,
-                            imu_orientation=imu_orientation,
-                            heightmap_data=self.heightmap.data if self.locomotion_policy.use_vision else None)
-
-                self.Kp_legs = self.locomotion_policy.Kp_walking
-                self.Kd_legs = self.locomotion_policy.Kd_walking
-
-            else:
-                # Go up-and-down
-                self.Kp_legs = self.locomotion_policy.Kp_stand_up_and_down
-                self.Kd_legs = self.locomotion_policy.Kd_stand_up_and_down
-
-            # Torque saturation for the legs
-            max_torque = self.mjModel.actuator_ctrlrange[0:12, 1]
-            max_torque = max_torque*0.95  # A margin for safety
-            lower = (-max_torque + self.Kd_legs * joints_vel_leg) / self.Kp_legs
-            upper = ( max_torque + self.Kd_legs * joints_vel_leg) / self.Kp_legs
-
-            self.desired_joint_pos_leg = np.clip(
-                self.desired_joint_pos_leg,
-                joints_pos_leg + lower,
-                joints_pos_leg + upper
-            )
-            
-            # PD controller --------------------------------------------------------------
-            error_joints_pos_leg = self.desired_joint_pos_leg - joints_pos_leg
-            tau_leg = self.Kp_legs*error_joints_pos_leg - self.Kd_legs*joints_vel_leg
-
-            error_joints_pos_arm = self.desired_joint_pos_arm - joints_pos_arm
-            tau_arm = self.Kp_arm*error_joints_pos_arm - self.Kd_arm*joints_vel_arm
-
-            # Compute the inverse dynamics
-            #M = np.zeros((self.mjModel.nv, self.mjModel.nv))
-            #mujoco.mj_fullM(self.mjModel, M, self.mjData.qM)
-            #M = M[18:24, 18:24]
-            #tau_arm += M @ (self.Kp_arm * (error_joints_pos_arm) - self.Kd_arm * joints_vel_arm)
-            #tau_arm += self.mjData.qfrc_bias[18:24]
-
-            error_gripper_pos = self.desired_joint_pos_gripper - joints_pos_gripper
-            tau_gripper = config.Kp_gripper*error_gripper_pos - config.Kd_gripper*joints_vel_gripper
-
-            
-            # Set control and mujoco step ----------------------------------------------------------------------
-            self.mjData.ctrl[0:12] = tau_leg
-            self.mjData.ctrl[12:18] = tau_arm 
-            self.mjData.ctrl[18] = tau_gripper
-            mujoco.mj_step(self.mjModel, self.mjData)
-            step_num = step_num + 1
-
-
-            # Sleep to match real-time ---------------------------------------------------------
-            loop_elapsed_time = time.time() - step_start
-            if(loop_elapsed_time < self.simulation_dt):
-                time.sleep(self.simulation_dt - (loop_elapsed_time))
-
-
-            # Render only at a certain frequency -----------------------------------------------------------------
-            if time.time() - self.last_render_time > 1.0 / self.RENDER_FREQ:
-                # Update the camera position
-                self.viewer.cam.lookat[:] = base_pos
-                self.viewer.sync()
-                self.last_render_time = time.time()
-
-
-if __name__ == "__main__":
-    play_mujoco = PlayMujoco()
-    play_mujoco.run()
+if __name__=='__main__':
+    raise SystemExit(main())

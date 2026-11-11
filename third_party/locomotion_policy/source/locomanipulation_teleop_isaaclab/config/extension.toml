@@ -7,17 +7,16 @@ version = "0.1.1"
 category = "isaaclab"
 readme  = "README.md"
 
-title = "DLS Locomotion Isaac Lab Extension"
+title = "Go2 Standard PiPER Locomotion"
 author = "DLS team"
-maintainer = "DLS slaves"
-description="Isaac Lab extension from the Dynamic Legged Systems (DLS) team at Italian Institute of Technology (IIT)"
+maintainer = "go2_mobile_manipulator contributors"
+description="Flat/Rough leg policies with moving standard PiPER and commanded body posture; adapted from the DLS extension"
 repository = "https://github.com/iit-DLSLab/basic-locomotion-dls-isaaclab/"
-keywords = ["extension", "template", "isaaclab"]
+keywords = ["go2", "piper", "locomotion", "isaaclab"]
 
 [dependencies]
 "isaaclab" = {}
 "isaaclab_assets" = {}
-"isaaclab_mimic" = {}
 "isaaclab_rl" = {}
 "isaaclab_tasks" = {}
 # NOTE: Add additional dependencies here

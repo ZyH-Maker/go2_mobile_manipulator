@@ -1,0 +1,41 @@
+{
+  "source_urdf": "models/piper/piper.urdf",
+  "mount_xyz": [
+    0.0,
+    0.0,
+    0.07
+  ],
+  "gripper": "fixed_open_0.04m",
+  "inertia_corrections": [
+    {
+      "link": "link7",
+      "source_iyy": "-0.00000113",
+      "box_m": [
+        0.02,
+        0.06,
+        0.01
+      ],
+      "diaginertia": [
+        7.708333333333334e-06,
+        1.0416666666666667e-06,
+        8.333333333333334e-06
+      ]
+    },
+    {
+      "link": "link8",
+      "source_iyy": "-0.00000113",
+      "box_m": [
+        0.02,
+        0.06,
+        0.01
+      ],
+      "diaginertia": [
+        7.708333333333334e-06,
+        1.0416666666666667e-06,
+        8.333333333333334e-06
+      ]
+    }
+  ],
+  "arm_effort_limit_nm": 20,
+  "hardware_parameters_validated": false
+}

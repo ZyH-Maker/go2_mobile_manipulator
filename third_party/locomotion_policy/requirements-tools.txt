@@ -1,0 +1,10 @@
+# Install PyTorch through the Isaac Lab environment or the official PyTorch installer first.
+# These tools do not install or replace Isaac Sim, Isaac Lab or rsl-rl.
+numpy>=1.24,<3
+mujoco==3.2.3
+onnx>=1.16
+onnxruntime>=1.17
+PyYAML>=6
+toml>=0.10
+tensorboard>=2.14
+prettytable>=3

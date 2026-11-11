@@ -9,6 +9,11 @@
 
 import argparse
 import sys
+from pathlib import Path
+import json
+import shutil
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import policy_contract as spec
 
 from isaaclab.app import AppLauncher
 
@@ -34,6 +39,9 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--steps", type=int, default=1000, help="Finite evaluation steps; 0 exports only")
+parser.add_argument("--commands", type=float, nargs=5, default=None)
+parser.add_argument("--report", type=Path, default=None)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -91,6 +99,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
+    if args_cli.steps < 0:
+        raise ValueError("steps must be nonnegative")
+    env_cfg.noise = False
+    if args_cli.commands is not None:
+        env_cfg.random_commands = False
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
@@ -110,6 +123,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
+    spec.validate_manifest(Path(resume_path).parent/"params/policy_contract.json")
     log_dir = os.path.dirname(resume_path)
 
     # set the log directory for the environment (works for all environment types)
@@ -172,24 +186,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
+    spec.write_manifest(export_model_dir)
+    shutil.copytree(Path(log_dir)/"params", Path(export_model_dir)/"params", dirs_exist_ok=True)
+    shutil.copy2(resume_path, Path(export_model_dir)/Path(resume_path).name)
     dt = env.unwrapped.step_dt
 
     # reset environment
     obs = env.get_observations()
     timestep = 0
+    terminations = 0
+    samples = {}
+    if args_cli.commands is not None:
+        command = torch.tensor(args_cli.commands, device=env.unwrapped.device).expand(env.unwrapped.num_envs,-1)
+        env.unwrapped.set_commands(command)
     # simulate environment
-    while simulation_app.is_running():
+    while simulation_app.is_running() and timestep < args_cli.steps:
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
+            if timestep > 100:
+                for key,value in env.unwrapped.metrics().items():
+                    if value.dtype != torch.bool:
+                        samples.setdefault(key, []).append(float(value.square().mean().item()))
             # env stepping
             obs, _, dones, _ = env.step(actions)
+            terminations += int((dones.bool() & ~env.unwrapped.reset_time_outs).sum().item())
+            if args_cli.commands is not None:
+                env.unwrapped.set_commands(command)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
+        timestep += 1
         if args_cli.video:
-            timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
@@ -199,6 +228,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
+    report = dict(checkpoint=resume_path, task=args_cli.task, steps=timestep, num_envs=env.unwrapped.num_envs,
+        terminations=terminations, rmse={k:(sum(v)/len(v))**.5 for k,v in samples.items()},
+        note="Evaluation metrics, not hardware approval; review tracking and termination rates")
+    if args_cli.report:
+        args_cli.report.parent.mkdir(parents=True, exist_ok=True)
+        args_cli.report.write_text(json.dumps(report,indent=2)+"\n")
+    print(json.dumps(report,indent=2))
     # close the simulator
     env.close()
 
